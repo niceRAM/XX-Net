@@ -1,37 +1,14 @@
 import threading
 import select
 import time
+import ssl
+import socket
 
 import utils
 
 import global_var as g
 from xlog import getLogger
 xlog = getLogger("smart_router")
-
-
-class Buf(object):
-    def __init__(self):
-        self.buf = []
-        self.size = 0
-        self.num = 0
-
-    def add(self, data):
-        self.buf.append(data)
-        self.size += len(data)
-        self.num += 1
-
-    def get(self):
-        if not self.buf:
-            return ""
-        dat = self.buf.pop(0)
-        self.size -= len(dat)
-        self.num -= 1
-        return dat
-
-    def restore(self, dat):
-        self.buf.insert(0, dat)
-        self.size += len(dat)
-        self.num += 1
 
 
 class PipeSocks(object):
@@ -42,9 +19,6 @@ class PipeSocks(object):
         self.read_set = []
         self.write_set = []
         self.error_set = []
-
-        # sock => Buf
-        self.send_buf = {}
 
         self.running = True
 
@@ -69,11 +43,6 @@ class PipeSocks(object):
         for s in self.error_set:
             outs.append(" %s" % s)
 
-        outs.append("send buf:")
-        for s in self.send_buf:
-            buf = self.send_buf[s]
-            outs.append(" %s size=%d num=%d" % (s, buf.size, buf.num))
-
         return "\n".join(outs)
 
     def run(self):
@@ -84,6 +53,15 @@ class PipeSocks(object):
         self.running = False
 
     def add_socks(self, s1, s2):
+        for s in [s1, s2]:
+            if isinstance(s._sock, socket._closedsocket) or \
+                    (isinstance(s._sock, ssl.SSLSocket) and
+                     isinstance(s._sock._sock, socket._closedsocket)):
+                xlog.warn("try to add_socks closed socket:%s %s", s1, s2)
+                s1.close()
+                s2.close()
+                return
+
         s1.setblocking(0)
         s2.setblocking(0)
 
@@ -107,10 +85,6 @@ class PipeSocks(object):
             return
 
         s2 = self.sock_dict[s1]
-        if s1 in self.send_buf:
-            left1 = self.send_buf[s1].size
-        else:
-            left1 = 0
 
         if utils.is_private_ip(s1.ip):
             local_sock = s1
@@ -124,7 +98,7 @@ class PipeSocks(object):
                    local_sock, remote_sock, create_time,
                    local_sock.recved_data, local_sock.recved_times,
                    remote_sock.recved_data, remote_sock.recved_times,
-                   s1==remote_sock, left1, e)
+                   s1==remote_sock, s1.buf_size, e)
 
         if local_sock.recved_data > 0 and local_sock.recved_times == 1 and remote_sock.port == 443 and \
                 ((s1 == local_sock and create_time > 30) or (s1 == remote_sock)):
@@ -136,23 +110,19 @@ class PipeSocks(object):
         self.try_remove(self.read_set, s1)
         self.try_remove(self.write_set, s1)
         self.try_remove(self.error_set, s1)
-        if s1 in self.send_buf:
-            del self.send_buf[s1]
         s1.close()
 
-        if s2 in self.send_buf and self.send_buf[s2].size:
+        if s2.buf_size:
             xlog.debug("pipe close %s e:%s, but s2:%s have data(%d) to send",
-                       s1, e, s2, self.send_buf[s2].size)
-            self.send_buf[s2].add("")
+                       s1, e, s2, s2.buf_size)
+            s2.add_dat("")
             return
 
         if s2 in self.sock_dict:
+            del self.sock_dict[s2]
             self.try_remove(self.read_set, s2)
             self.try_remove(self.write_set, s2)
             self.try_remove(self.error_set, s2)
-            del self.sock_dict[s2]
-            if s2 in self.send_buf:
-                del self.send_buf[s2]
             s2.close()
 
     def pipe(self):
@@ -164,8 +134,14 @@ class PipeSocks(object):
 
         while self.running:
             if not self.error_set:
-                time.sleep(1)
+                time.sleep(0.1)
                 continue
+
+            for s1 in self.error_set:
+                s2 = self.sock_dict[s1]
+                if s2 not in self.sock_dict and \
+                        s1 not in self.read_set and s1 not in self.write_set:
+                    self.close(s1, "miss")
 
             try:
                 r, w, e = select.select(self.read_set, self.write_set, self.error_set, 0.1)
@@ -191,9 +167,6 @@ class PipeSocks(object):
                     if s2.is_closed():
                         continue
 
-                    if s2 not in self.send_buf:
-                        self.send_buf[s2] = Buf()
-
                     if g.config.direct_split_SNI and\
                                     s1.recved_times == 1 and \
                                     s2.port == 443 and \
@@ -216,53 +189,78 @@ class PipeSocks(object):
                                 self.close(s2, "w")
                                 continue
 
-                            self.send_buf[s2].add(d2)
+                            s2.add_dat(d2)
                             d = ""
                             xlog.debug("pipe send split SNI:%s", s2.host)
 
+                    if s2.buf_size == 0:
+                        try:
+                            sended = s2.send(d)
+                            # xlog.debug("direct send %d to %s from:%s", sended, s2, s1)
+                        except Exception as e:
+                            self.close(s2, "w")
+                            continue
+
+                        if sended == len(d):
+                            continue
+                        else:
+                            d_view = memoryview(d)
+                            d = d_view[sended:]
+
                     if d:
-                        self.send_buf[s2].add(d)
+                        if not isinstance(d, memoryview):
+                            d = memoryview(d)
+                        s2.add_dat(d)
 
                     if s2 not in self.write_set:
                         self.write_set.append(s2)
-                    if self.send_buf[s2].size > self.buf_size:
-                        self.read_set.remove(s1)
+                    if s2.buf_size > self.buf_size:
+                        self.try_remove(self.read_set, s1)
 
                 for s1 in list(w):
                     if s1 not in self.write_set:
                         continue
 
-                    if s1 not in self.send_buf or self.send_buf[s1].num == 0:
-                        self.write_set.remove(s1)
+                    if s1.buf_num == 0:
+                        self.try_remove(self.write_set, s1)
                         continue
 
-                    dat = self.send_buf[s1].get()
-                    if not dat:
-                        self.close(s1, "n")
-                        continue
+                    while s1.buf_num:
+                        dat = s1.get_dat()
+                        if not dat:
+                            self.close(s1, "n")
+                            break
 
-                    try:
-                        sended = s1.send(dat)
-                    except Exception as e:
-                        self.close(s1, "w")
-                        continue
+                        try:
+                            sended = s1.send(dat)
+                        except Exception as e:
+                            self.close(s1, "w")
+                            break
 
-                    if len(dat) - sended > 0:
-                        self.send_buf[s1].restore(dat[sended:])
-                        continue
+                        if len(dat) - sended > 0:
+                            s1.restore_dat(dat[sended:])
+                            break
 
-                    if self.send_buf[s1].size == 0:
-                        self.write_set.remove(s1)
+                    if s1.buf_size < self.buf_size:
+                        if s1 not in self.sock_dict:
+                            continue
 
-                    if self.send_buf[s1].size < self.buf_size:
                         s2 = self.sock_dict[s1]
                         if s2 not in self.read_set and s2 in self.sock_dict:
                             self.read_set.append(s2)
+                        elif s1.buf_size == 0 and s2.is_closed():
+                            self.close(s1, "n")
 
                 for s1 in list(e):
                     self.close(s1, "e")
             except Exception as e:
                 xlog.exception("pipe except:%r", e)
+                for s in list(self.error_set):
+                    if isinstance(s._sock, socket._closedsocket) or \
+                            (isinstance(s._sock, ssl.SSLSocket) and
+                             isinstance(s._sock._sock, socket._closedsocket)):
+                        xlog.warn("socket %s is closed", s)
+                        self.close(s, "e")
 
         for s in list(self.error_set):
             self.close(s, "stop")

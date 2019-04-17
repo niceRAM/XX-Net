@@ -55,7 +55,12 @@ class PacHandler(simple_http_server.HttpServerHandler):
         proxy = host + ":" + str(port)
         content = content.replace(self.PROXY_LISTEN, proxy)
 
-        black, white = g.gfwlist.get_pac_string()
+        black = '",\n"'.join(g.gfwlist.gfw_black_list
+                             + g.user_rules.rule_lists["gae"]
+                             + g.user_rules.rule_lists["socks"]
+                             )
+        white = '",\n"'.join(g.gfwlist.gfw_white_list + g.user_rules.rule_lists["direct"])
+
         content = content.replace("BLACK_LIST", black).replace("WHITE_LIST", white)
         return content
 
@@ -70,9 +75,9 @@ class PacHandler(simple_http_server.HttpServerHandler):
         host, _, port = host.rpartition(":")
 
         if g.config.pac_policy == "black_GAE":
-            content = self.policy_black_port(host, "8087")
+            content = self.policy_black_port(host, "%s" % g.gae_proxy_listen_port)
         elif g.config.pac_policy == "black_X-Tunnel":
-            content = self.policy_black_port(host, "1080")
+            content = self.policy_black_port(host, "%s" % g.x_tunnel_socks_port)
         else:
             content = self.policy_smart_router(host)
 

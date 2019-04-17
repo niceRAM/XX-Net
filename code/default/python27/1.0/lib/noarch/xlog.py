@@ -9,6 +9,8 @@ import json
 import shutil
 import types
 
+reload(sys)
+sys.setdefaultencoding('utf8')
 
 CRITICAL = 50
 FATAL = CRITICAL
@@ -112,7 +114,7 @@ class Logger():
 
     def log(self, level, console_color, html_color, fmt, *args, **kwargs):
         now = datetime.now()
-        time_str = now.strftime("%b %d %H:%M:%S.%f")[:19]
+        time_str = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:23]
         string = '%s - [%s] %s\n' % (time_str, level, fmt % args)
         self.buffer_lock.acquire()
         try:
@@ -227,6 +229,21 @@ class Logger():
             print("line can't decode:%s" % line)
             print("Except stack:%s" % traceback.format_exc())
             return ""
+
+
+class null():
+    @staticmethod
+    def debug(fmt, *args, **kwargs):
+        pass
+    @staticmethod
+    def info(fmt, *args, **kwargs):
+        pass
+    @staticmethod
+    def warn(fmt, *args, **kwargs):
+        pass
+    @staticmethod
+    def exception(fmt, *args, **kwargs):
+        pass
 
 
 loggerDict = {}

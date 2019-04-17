@@ -6,16 +6,19 @@ import os
 import cgi
 import time
 import hashlib
-
-from xlog import getLogger
 import threading
+
+import utils
+from xlog import getLogger
 xlog = getLogger("x_tunnel")
 
 import simple_http_server
 import global_var as g
 import proxy_session
 from cloudflare_front import web_control as cloudflare_web
-#from heroku_front import web_control as heroku_web
+from cloudfront_front import web_control as cloudfront_web
+from tls_relay_front import web_control as tls_relay_web
+from heroku_front import web_control as heroku_web
 from front_dispatcher import all_fronts
 
 current_path = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +44,8 @@ class ControlHandler(simple_http_server.HttpServerHandler):
             return self.send_response('text/html', data)
         elif path == "/info":
             return self.req_info_handler()
+        elif path == "/config":
+            return self.req_config_handler()
         elif path == "/get_history":
             return self.req_get_history_handler()
         elif path == "/status":
@@ -48,6 +53,27 @@ class ControlHandler(simple_http_server.HttpServerHandler):
         elif path.startswith("/cloudflare_front/"):
             path = self.path[17:]
             controler = cloudflare_web.ControlHandler(self.client_address,
+                             self.headers,
+                             self.command, path,
+                             self.rfile, self.wfile)
+            controler.do_GET()
+        elif path.startswith("/cloudfront_front/"):
+            path = self.path[17:]
+            controler = cloudfront_web.ControlHandler(self.client_address,
+                             self.headers,
+                             self.command, path,
+                             self.rfile, self.wfile)
+            controler.do_GET()
+        elif path.startswith("/heroku_front/"):
+            path = self.path[13:]
+            controler = heroku_web.ControlHandler(self.client_address,
+                             self.headers,
+                             self.command, path,
+                             self.rfile, self.wfile)
+            controler.do_GET()
+        elif path.startswith("/tls_relay_front/"):
+            path = self.path[16:]
+            controler = tls_relay_web.ControlHandler(self.client_address,
                              self.headers,
                              self.command, path,
                              self.rfile, self.wfile)
@@ -76,6 +102,8 @@ class ControlHandler(simple_http_server.HttpServerHandler):
             return self.req_logout_handler()
         elif path == "/register":
             return self.req_login_handler()
+        elif path == "/config":
+            return self.req_config_handler()
         elif path == "/order":
             return self.req_order_handler()
         elif path == "/transfer":
@@ -83,6 +111,27 @@ class ControlHandler(simple_http_server.HttpServerHandler):
         elif path.startswith("/cloudflare_front/"):
             path = path[17:]
             controler = cloudflare_web.ControlHandler(self.client_address,
+                                                      self.headers,
+                                                      self.command, path,
+                                                      self.rfile, self.wfile)
+            controler.do_POST()
+        elif path.startswith("/cloudfront_front/"):
+            path = path[17:]
+            controler = cloudfront_web.ControlHandler(self.client_address,
+                                                      self.headers,
+                                                      self.command, path,
+                                                      self.rfile, self.wfile)
+            controler.do_POST()
+        elif path.startswith("/heroku_front/"):
+            path = path[13:]
+            controler = heroku_web.ControlHandler(self.client_address,
+                                                      self.headers,
+                                                      self.command, path,
+                                                      self.rfile, self.wfile)
+            controler.do_POST()
+        elif path.startswith("/tls_relay_front/"):
+            path = path[16:]
+            controler = tls_relay_web.ControlHandler(self.client_address,
                                                       self.headers,
                                                       self.command, path,
                                                       self.rfile, self.wfile)
@@ -154,6 +203,8 @@ class ControlHandler(simple_http_server.HttpServerHandler):
             res_arr = {
                 "res": "success",
                 "login_account": "%s" % (g.config.login_account),
+                "promote_code": g.promote_code,
+                "promoter": g.promoter,
                 "balance": "%f" % (g.balance),
                 "quota": "%d" % (g.quota),
                 "quota_list": g.quota_list,
@@ -171,7 +222,9 @@ class ControlHandler(simple_http_server.HttpServerHandler):
                 return True
 
         username    = str(self.postvars['username'][0])
+        #username = utils.get_printable(username)
         password    = str(self.postvars['password'][0])
+        promoter = self.postvars.get("promoter", [""])[0]
         is_register = int(self.postvars['is_register'][0])
 
         pa = check_email(username)
@@ -199,7 +252,8 @@ class ControlHandler(simple_http_server.HttpServerHandler):
         else:
             password_hash = str(hashlib.sha256(password).hexdigest())
 
-        res, reason = proxy_session.request_balance(username, password_hash, is_register, update_server=True)
+        res, reason = proxy_session.request_balance(username, password_hash, is_register,
+                                                    update_server=True, promoter=promoter)
         if res:
             g.config.login_account  = username
             g.config.login_password = password_hash
@@ -226,6 +280,67 @@ class ControlHandler(simple_http_server.HttpServerHandler):
         g.session.stop()
 
         return self.response_json({"res": "success"})
+
+    def req_config_handler(self):
+        req = urlparse.urlparse(self.path).query
+        reqs = urlparse.parse_qs(req, keep_blank_values=True)
+
+        def is_server_available(server):
+            if g.selectable and server == '':
+                return True # "auto"
+            else:
+                for choice in g.selectable:
+                    if choice[0] == server:
+                        return True # "selectable"
+                return False # "unselectable"
+
+        if reqs['cmd'] == ['get']:
+            g.config.load()
+            server = {
+                'selectable': g.selectable,
+                'selected': 'auto' if g.config.server_host == '' else g.config.server_host,  # "auto" as default
+                'available': is_server_available(g.config.server_host)
+            }
+            res = {
+                'server': server,
+                'promoter': g.promoter
+            }
+        elif reqs['cmd'] == ['set']:
+            if 'server' in self.postvars:
+                server = str(self.postvars['server'][0])
+                server = '' if server == 'auto' else server
+
+                promoter = self.postvars.get("promoter", [""])[0]
+                if promoter != g.promoter:
+                    res, info = proxy_session.call_api("/set_config", {
+                        "account": g.config.login_account,
+                        "password": g.config.login_password,
+                        "promoter": promoter
+                    })
+                    if not res:
+                        xlog.warn("set_config fail:%s", info)
+                        return self.response_json({"res": "fail", "reason": info})
+                    else:
+                        g.promoter = promoter
+
+                if is_server_available(server):
+                    if server != g.config.server_host:
+                        g.server_host = g.config.server_host = server
+                        g.server_port = g.config.server_port = 443
+                        g.config.save()
+
+                        threading.Thread(target=g.session.reset).start()
+
+                    res = {"res": "success"}
+                else:
+                    res = {
+                        "res": "fail",
+                        "reason": "server not available"
+                    }
+            else:
+                res = {"res": "fail"}
+
+        return self.response_json(res)
 
     def req_order_handler(self):
         product = self.postvars['product'][0]
@@ -318,51 +433,7 @@ class ControlHandler(simple_http_server.HttpServerHandler):
         })
 
     def req_status(self):
-        def convert(num, units=('B', 'KB', 'MB', 'GB')):
-            for unit in units:
-                if num >= 1024:
-                    num /= 1024.0
-                else:
-                    break
-            return '{:.1f} {}'.format(num, unit)
-
-        res = {}
-        rtts = []
-        recent_sent = 0
-        recent_received = 0
-        total_sent = 0
-        total_received = 0
-        for front in all_fronts:
-            name = front.name
-            score = front.get_score()
-            if score is None:
-                score = "False"
-            else:
-                score = int(score)
-            rtts.append(front.get_rtt())
-            recent_sent += front.recent_sent
-            recent_received += front.recent_received
-            total_sent += front.total_sent
-            total_received += front.total_received
-            res[name] = {
-                "score": score,
-                "success_num": front.success_num,
-                "fail_num": front.fail_num,
-                "worker_num": front.worker_num(),
-                "total_traffics": "Up: %s / Down: %s" % (convert(front.total_sent), convert(front.total_received))
-            }
-
-        res["global"] = {
-            "socks_addr": "SOCKS5://%s:%d" % (g.config.socks_host, g.config.socks_port),
-            "handle_num": g.socks5_server.handler.handle_num,
-            "rtt": int(max(rtts)) or 9999,
-            "roundtrip_num": g.stat["roundtrip_num"],
-            "slow_roundtrip": g.stat["slow_roundtrip"],
-            "timeout_roundtrip": g.stat["timeout_roundtrip"],
-            "resend": g.stat["resend"],
-            "speed": "Up: %s/s / Down: %s/s" % (convert(recent_sent / 5.0), convert(recent_received / 5.0)),
-            "total_traffics": "Up: %s / Down: %s" % (convert(total_sent), convert(total_received))
-        }
+        res = g.session.get_stat()
 
         self.response_json({
             "res": "success",

@@ -15,7 +15,6 @@ import struct
 
 
 import xlog
-logging = xlog.getLogger("simple_http_server")
 
 
 class GetReqTimeout(Exception):
@@ -42,15 +41,19 @@ class HttpServerHandler():
     rbufsize = -1
     wbufsize = 0
 
-    def __init__(self, sock, client, args, logger=logging):
+    def __init__(self, sock, client, args, logger=None):
         self.connection = sock
         sock.setblocking(1)
-        sock.settimeout(300)
+        sock.settimeout(60)
         self.rfile = socket._fileobject(self.connection, "rb", self.rbufsize, close=True)
         self.wfile = socket._fileobject(self.connection, "wb", self.wbufsize, close=True)
         self.client_address = client
         self.args = args
-        self.logger = logger
+        if logger:
+            self.logger = logger
+        else:
+            self.logger = xlog.getLogger("simple_http_server")
+        #self.logger.debug("new connect from:%s", self.address_string())
 
         self.setup()
 
@@ -92,6 +95,9 @@ class HttpServerHandler():
 
         if len(self.raw_requestline) > 65536:
             raise ParseReqFail("Recv command line too large")
+
+        if self.raw_requestline[0] == '\x16':
+            raise socket.error
 
         self.command = None  # set in case of error on the first line
         self.request_version = version = self.default_request_version
@@ -137,6 +143,7 @@ class HttpServerHandler():
         # Examine the headers and look for a Connection directive
         self.headers = self.MessageClass(self.rfile, 0)
 
+        self.host = self.headers.get('Host', "")
         conntype = self.headers.get('Connection', "")
         if conntype.lower() == 'close':
             self.close_connection = 1
@@ -276,7 +283,10 @@ class HttpServerHandler():
 
     def WebSocket_on_connect(self):
         # Define the function and return True to accept
-        self.logger.warn("unhandler WebSocket from %s", self.address_string())
+        self.logger.warn("unhandled WebSocket from %s", self.address_string())
+        self.send_error(501, "Not supported")
+        self.close_connection = 1
+
         return False
 
     def do_GET(self):
@@ -301,9 +311,11 @@ class HttpServerHandler():
         self.logger.warn("unhandler cmd:%s from:%s", self.command, self.address_string())
 
     def send_not_found(self):
+        self.close_connection = 1
         self.wfile.write(b'HTTP/1.1 404\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n404 Not Found')
 
     def send_error(self, code, message=None):
+        self.close_connection = 1
         self.wfile.write('HTTP/1.1 %d\r\n' % code)
         self.wfile.write('Connection: close\r\n\r\n')
         if message:
@@ -333,6 +345,24 @@ class HttpServerHandler():
             self.wfile.write(data_str)
             if len(content):
                 self.wfile.write(content)
+
+    def send_redirect(self, url, headers={}, content="", status=307, text="Temporary Redirect"):
+        headers["Location"] = url
+        data = []
+        data.append('HTTP/1.1 %d\r\n' % status)
+        data.append('Content-Length: %s\r\n' % len(content))
+
+        if len(headers):
+            if isinstance(headers, dict):
+                for key in headers:
+                    data.append("%s: %s\r\n" % (key, headers[key]))
+            elif isinstance(headers, basestring):
+                data.append(headers)
+        data.append("\r\n")
+
+        data.append(content)
+        data_str = "".join(data)
+        self.wfile.write(data_str)
 
     def send_response_nc(self, mimetype="", content="", headers="", status=200):
         no_cache_headers = "Cache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\n"
@@ -366,7 +396,7 @@ class HttpServerHandler():
 
 
 class HTTPServer():
-    def __init__(self, address, handler, args=(), use_https=False, cert="", logger=logging):
+    def __init__(self, address, handler, args=(), use_https=False, cert="", logger=xlog):
         self.sockets = []
         self.running = True
         if isinstance(address, tuple):
@@ -388,8 +418,16 @@ class HTTPServer():
         self.http_thread.start()
 
     def init_socket(self):
-        for addr in self.server_address:
-            self.add_listen(addr)
+        server_address = set(self.server_address)
+        ips = [ip for ip, _ in server_address]
+        listen_all_v4 = "0.0.0.0" in ips
+        listen_all_v6 = "::" in ips
+        for ip, port in server_address:
+            if ip not in ("0.0.0.0", "::") and (
+                    listen_all_v4 and '.' in ip or
+                    listen_all_v6 and ':' in ip):
+                continue
+            self.add_listen((ip, port))
 
     def add_listen(self, addr):
         if ":" in addr[0]:
@@ -424,6 +462,14 @@ class HTTPServer():
         self.sockets.append(sock)
         self.logger.info("server %s:%d started.", addr[0], addr[1])
 
+    def dopoll(self, poller):
+        while True:
+            try:
+                return poller.poll()
+            except IOError as e:
+                if e.errno != 4:  # EINTR:
+                    raise
+
     def serve_forever(self):
         if hasattr(select, 'epoll'):
 
@@ -436,7 +482,15 @@ class HTTPServer():
                 fn_map[fn] = sock
 
             while self.running:
-                events = p.poll(timeout=1)
+                try:
+                    events = p.poll(timeout=1)
+                except IOError as e:
+                    if e.errno != 4:  # EINTR:
+                        raise
+                    else:
+                        time.sleep(1)
+                        continue
+
                 for fn, event in events:
                     if fn not in fn_map:
                         self.logger.error("p.poll get fn:%d", fn)
@@ -492,8 +546,7 @@ class HTTPServer():
 
     def shutdown(self):
         self.running = False
-        while self.sockets:
-            time.sleep(1)
+        self.server_close()
 
     def server_close(self):
         for sock in self.sockets:

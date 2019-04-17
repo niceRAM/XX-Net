@@ -16,6 +16,7 @@ class GfwList(object):
     def __init__(self):
         self.gfw_black_list = self.load("gfw_black_list.txt")
         self.gfw_white_list = self.load("gfw_white_list.txt")
+        self.advertisement_list = self.load("advertisement_list.txt")
 
     def load(self, name):
         user_file = os.path.join(data_path, name)
@@ -54,7 +55,14 @@ class GfwList(object):
 
         return False
 
-    def get_pac_string(self):
-        black = '",\n"'.join(self.gfw_black_list)
-        white = '",\n"'.join(self.gfw_white_list)
-        return black, white
+    def is_white(self, host):
+        if host.endswith(self.gfw_white_list):
+            return True
+        else:
+            return False
+
+    def is_advertisement(self, host):
+        if host.endswith(self.advertisement_list):
+            return True
+        else:
+            return False

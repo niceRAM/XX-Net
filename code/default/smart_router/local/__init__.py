@@ -1,6 +1,5 @@
 import os
 import sys
-import json
 import apis
 
 from xlog import getLogger
@@ -58,12 +57,13 @@ def load_config():
 
     config.set_var("dns_bind_ip", "127.0.0.1")
     config.set_var("dns_port", 53)
+    config.set_var("dns_backup_port", 8053)
 
     config.set_var("proxy_bind_ip", "127.0.0.1")
     config.set_var("proxy_port", 8086)
 
     config.set_var("dns_cache_size", 200)
-    config.set_var("pip_cache_size", 16*1024)
+    config.set_var("pip_cache_size", 32*1024)
     config.set_var("ip_cache_size", 1000)
     config.set_var("dns_ttl", 24*3600)
     config.set_var("direct_split_SNI", 1)
@@ -71,7 +71,10 @@ def load_config():
     config.set_var("pac_policy", "black_GAE")
     config.set_var("country_code", "CN")
     config.set_var("auto_direct", True)
+    config.set_var("auto_direct6", False)
     config.set_var("auto_gae", True)
+    config.set_var("enable_fake_ca", True)
+    config.set_var("block_advertisement", True)
 
     config.load()
     if config.PROXY_ENABLE:
@@ -89,11 +92,13 @@ def run(args):
 
     if "gae_proxy" in proc_handler:
         g.gae_proxy = proc_handler["gae_proxy"]["imp"].local
+        g.gae_proxy_listen_port = g.gae_proxy.config.config.listen_port
     else:
         xlog.debug("gae_proxy not running")
 
     if "x_tunnel" in proc_handler:
         g.x_tunnel = proc_handler["x_tunnel"]["imp"].local
+        g.x_tunnel_socks_port = g.x_tunnel.global_var.config.socks_port
     else:
         xlog.debug("x_tunnel not running")
 
@@ -115,22 +120,33 @@ def run(args):
     g.dns_client = dns_server.DnsClient()
 
     allow_remote = args.get("allow_remote", 0)
-    if allow_remote:
-        listen_ip = "0.0.0.0"
+
+    listen_ips = g.config.proxy_bind_ip
+    if isinstance(listen_ips, basestring):
+        listen_ips = [listen_ips]
     else:
-        listen_ip = g.config.proxy_bind_ip
-    g.proxy_server = simple_http_server.HTTPServer((listen_ip, g.config.proxy_port),
+        listen_ips = list(listen_ips)
+    if allow_remote and ("0.0.0.0" not in listen_ips or "::" not in listen_ips):
+        listen_ips.append("0.0.0.0")
+    addresses = [(listen_ip, g.config.proxy_port) for listen_ip in listen_ips]
+
+    g.proxy_server = simple_http_server.HTTPServer(addresses,
                                                    proxy_handler.ProxyServer, logger=xlog)
     g.proxy_server.start()
-    xlog.info("Proxy server listen:%s:%d.", g.config.proxy_bind_ip, g.config.proxy_port)
+    xlog.info("Proxy server listen:%s:%d.", listen_ip, g.config.proxy_port)
 
-    allow_remote = args.get("allow_remote", 0)
-    if allow_remote:
-        listen_ip = "0.0.0.0"
+    listen_ips = g.config.dns_bind_ip
+    if isinstance(listen_ips, basestring):
+        listen_ips = [listen_ips]
     else:
-        listen_ip = g.config.dns_bind_ip
-    g.dns_srv = dns_server.DnsServer(bind_ip=listen_ip, port=g.config.dns_port,
-                                   ttl=g.config.dns_ttl)
+        listen_ips = list(listen_ips)
+    if allow_remote and ("0.0.0.0" not in listen_ips or "::" not in listen_ips):
+        listen_ips.append("0.0.0.0")
+
+    g.dns_srv = dns_server.DnsServer(
+        bind_ip=listen_ips, port=g.config.dns_port,
+        backup_port=g.config.dns_backup_port,
+        ttl=g.config.dns_ttl)
     ready = True
     g.dns_srv.server_forever()
 
